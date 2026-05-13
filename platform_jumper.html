@@ -1,0 +1,1059 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>向上跳跃 - 平台跳跃</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a2e;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    touch-action: manipulation;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  canvas {
+    display: block;
+    border-radius: 8px;
+    box-shadow: 0 0 40px rgba(80, 80, 255, 0.3);
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  // --- Canvas Setup ---
+  const W = 400, H = 700;
+  canvas.width = W;
+  canvas.height = H;
+
+  function resize() {
+    const scale = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.95;
+    canvas.style.width = W * scale + 'px';
+    canvas.style.height = H * scale + 'px';
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ================================================================
+  // --- Audio System (Web Audio API synthesis) ---
+  //   Mix hierarchy per skill: Music -9dB, Player SFX -3dB, UI SFX 0dB
+  // ================================================================
+  const Audio = (() => {
+    let ctx = null;
+    let master, musicBus, sfxBus;
+    let bgmNodes = null;
+    let bgmPlaying = false;
+
+    // Platform SFX variation pools (3-5 variations each, per anti-pattern guidance)
+    const sfxVariants = {};
+
+    function ensureCtx() {
+      if (!ctx) {
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        // Master
+        master = ctx.createGain();
+        master.gain.value = 0.55;
+        master.connect(ctx.destination);
+        // Music bus (-9dB relative to master ≈ gain 0.35)
+        musicBus = ctx.createGain();
+        musicBus.gain.value = 0.18;
+        musicBus.connect(master);
+        // SFX bus (-3dB relative to master ≈ gain 0.7)
+        sfxBus = ctx.createGain();
+        sfxBus.gain.value = 0.55;
+        sfxBus.connect(master);
+      }
+      if (ctx.state === 'suspended') ctx.resume();
+    }
+
+    // Helper: play a tone with envelope
+    function playTone(freq, type, duration, gainVal, bus, detune = 0, freqEnd = null) {
+      ensureCtx();
+      const t = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t);
+      osc.detune.setValueAtTime(detune, t);
+      if (freqEnd !== null) {
+        osc.frequency.linearRampToValueAtTime(freqEnd, t + duration);
+      }
+      g.gain.setValueAtTime(gainVal, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + duration);
+      osc.connect(g);
+      g.connect(bus);
+      osc.start(t);
+      osc.stop(t + duration);
+      return { osc, gain: g };
+    }
+
+    // Helper: noise burst
+    function playNoise(duration, gainVal, bus, lowpass = 3000) {
+      ensureCtx();
+      const t = ctx.currentTime;
+      const bufferSize = ctx.sampleRate * duration;
+      const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(lowpass, t);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(gainVal, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + duration);
+      src.connect(filter);
+      filter.connect(g);
+      g.connect(bus);
+      src.start(t);
+      src.stop(t + duration);
+    }
+
+    // --- Jelly Jump SFX ---
+    // Layer structure: Attack (click) + Body (wobble sweep) + Tail (soft decay)
+    function playJump() {
+      ensureCtx();
+      const t = ctx.currentTime;
+      const dur = 0.18;
+
+      // Attack: quick sine click
+      playTone(600, 'sine', 0.03, 0.25, sfxBus);
+
+      // Body: triangle sweep 220→880Hz with tremolo wobble
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      const lfo = ctx.createOscillator();
+      const lfoG = ctx.createGain();
+
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(220, t);
+      osc.frequency.exponentialRampToValueAtTime(880, t + dur * 0.6);
+      osc.frequency.exponentialRampToValueAtTime(660, t + dur);
+
+      lfo.frequency.value = 18; // 18Hz tremolo for jelly wobble
+      lfoG.gain.value = 30;
+      lfo.connect(lfoG);
+      lfoG.connect(osc.frequency);
+      lfo.start(t);
+      lfo.stop(t + dur);
+
+      g.gain.setValueAtTime(0.35, t);
+      g.gain.setValueAtTime(0.35, t + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+
+      osc.connect(g);
+      g.connect(sfxBus);
+      osc.start(t);
+      osc.stop(t + dur);
+    }
+
+    // --- Platform-specific SFX ---
+    function playPlatform(type) {
+      ensureCtx();
+      const t = ctx.currentTime;
+      switch (type) {
+        case PT.NORMAL:
+          // Soft pop: sine 520Hz, 60ms
+          playTone(520, 'sine', 0.06, 0.2, sfxBus);
+          break;
+        case PT.BOUNCY:
+          // Boing sweep: triangle 180→1100Hz, 200ms
+          playTone(180, 'triangle', 0.20, 0.3, sfxBus, 0, 1100);
+          // Sweetener: high harmonic ping
+          playTone(1600, 'sine', 0.08, 0.12, sfxBus);
+          break;
+        case PT.FRAGILE:
+          // Crack: noise burst 80ms + low thud
+          playNoise(0.08, 0.3, sfxBus, 6000);
+          playTone(70, 'sine', 0.12, 0.3, sfxBus);
+          break;
+        case PT.MOVING_H:
+        case PT.MOVING_V:
+          // Whoosh: filtered noise sweep
+          playNoise(0.12, 0.15, sfxBus, 800);
+          playTone(350, 'sine', 0.1, 0.15, sfxBus, 0, 500);
+          break;
+        case PT.SPRING:
+          // Deep twang + launch
+          playTone(80, 'triangle', 0.25, 0.4, sfxBus, 0, 400);
+          setTimeout(() => playTone(1200, 'sine', 0.1, 0.2, sfxBus, 0, 2000), 60);
+          break;
+        case PT.DISAPPEARING:
+          // Shimmer: high sine fading out
+          playTone(1200, 'sine', 0.25, 0.2, sfxBus, 0, 600);
+          playTone(1600, 'sine', 0.20, 0.12, sfxBus, 0, 800);
+          break;
+        case PT.CONVEYOR:
+          // Mechanical blip: square wave stutter
+          playTone(200, 'square', 0.04, 0.1, sfxBus);
+          setTimeout(() => playTone(250, 'square', 0.04, 0.1, sfxBus), 50);
+          break;
+      }
+    }
+
+    // --- Background Music: calm ambient pad ---
+    // Two detuned sawtooth waves + slow LFO filter sweep
+    function startBGM() {
+      ensureCtx();
+      if (bgmPlaying) return;
+      bgmPlaying = true;
+      const t = ctx.currentTime;
+
+      // Chord: Am7 (A3, C4, E4, G4) — calm, slightly melancholic
+      const freqs = [220, 261.63, 329.63, 392];
+      const oscs = [];
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 400;
+      filter.Q.value = 0.5;
+
+      const filterLfo = ctx.createOscillator();
+      const filterLfoG = ctx.createGain();
+      filterLfo.frequency.value = 0.08; // Very slow sweep
+      filterLfoG.gain.value = 200;
+      filterLfo.connect(filterLfoG);
+      filterLfoG.connect(filter.frequency);
+      filterLfo.start(t);
+
+      filter.connect(musicBus);
+
+      for (const freq of freqs) {
+        // Two detuned oscillators per note for richness
+        for (const det of [-6, 6]) {
+          const osc = ctx.createOscillator();
+          const g = ctx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.value = freq;
+          osc.detune.value = det;
+          g.gain.value = 0.08;
+          osc.connect(g);
+          g.connect(filter);
+          osc.start(t);
+          oscs.push({ osc, gain: g });
+        }
+      }
+
+      // Subtle sub-bass
+      const sub = ctx.createOscillator();
+      const subG = ctx.createGain();
+      sub.type = 'sine';
+      sub.frequency.value = 55; // A2
+      subG.gain.value = 0.1;
+      sub.connect(subG);
+      subG.connect(filter);
+      sub.start(t);
+      oscs.push({ osc: sub, gain: subG });
+
+      // Slow amplitude modulation for breathing effect
+      const ampLfo = ctx.createOscillator();
+      const ampLfoG = ctx.createGain();
+      ampLfo.frequency.value = 0.12;
+      ampLfoG.gain.value = 0.03;
+      ampLfo.connect(ampLfoG);
+      ampLfoG.connect(musicBus.gain);
+      ampLfo.start(t);
+
+      bgmNodes = { oscs, filter, filterLfo, filterLfoG, ampLfo, ampLfoG, sub, subG };
+    }
+
+    function stopBGM() {
+      if (!bgmPlaying || !bgmNodes) return;
+      bgmPlaying = false;
+      const t = ctx.currentTime;
+      try {
+        for (const n of bgmNodes.oscs) { try { n.osc.stop(t); } catch (e) { /* already stopped */ } }
+        bgmNodes.filterLfo.stop(t);
+        bgmNodes.ampLfo.stop(t);
+      } catch (e) { /* best effort */ }
+      bgmNodes = null;
+    }
+
+    // --- Game Over: descending sad arpeggio ---
+    function playGameOver() {
+      ensureCtx();
+      stopBGM();
+      const t = ctx.currentTime;
+      // Descending minor: A4, E4, C4, A3 — regretful
+      const notes = [
+        { freq: 440, delay: 0, dur: 0.3 },
+        { freq: 329.63, delay: 0.2, dur: 0.3 },
+        { freq: 261.63, delay: 0.4, dur: 0.35 },
+        { freq: 220, delay: 0.65, dur: 0.5 },
+      ];
+      for (const n of notes) {
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.value = n.freq;
+        g.gain.setValueAtTime(0, t + n.delay);
+        g.gain.linearRampToValueAtTime(0.25, t + n.delay + 0.04);
+        g.gain.exponentialRampToValueAtTime(0.001, t + n.delay + n.dur);
+        osc.connect(g);
+        g.connect(sfxBus);
+        osc.start(t + n.delay);
+        osc.stop(t + n.delay + n.dur + 0.05);
+      }
+      // Low rumble underneath
+      const rumble = ctx.createOscillator();
+      const rG = ctx.createGain();
+      rumble.type = 'sine';
+      rumble.frequency.value = 45;
+      rG.gain.setValueAtTime(0.15, t + 0.3);
+      rG.gain.exponentialRampToValueAtTime(0.001, t + 1.2);
+      rumble.connect(rG);
+      rG.connect(sfxBus);
+      rumble.start(t + 0.3);
+      rumble.stop(t + 1.2);
+    }
+
+    return { ensureCtx, playJump, playPlatform, startBGM, stopBGM, playGameOver };
+  })();
+
+  // --- Constants ---
+  const GRAVITY = 0.5;
+  const JUMP_FORCE = -10;
+  const SPRING_FORCE = -17;
+  const PLAYER_SPEED = 5;
+  const PLATFORM_W = 70;
+  const PLATFORM_H = 14;
+  const MIN_GAP = 45;
+  const MAX_GAP = 95;
+
+  // --- Platform Types ---
+  const PT = {
+    NORMAL:       { name: '普通',   color: '#22c55e', glow: '#4ade80', icon: '' },
+    BOUNCY:       { name: '弹力',   color: '#db2777', glow: '#f472b6', icon: '↑↑' },
+    FRAGILE:      { name: '碎裂',   color: '#d97706', glow: '#fbbf24', icon: '✕' },
+    MOVING_H:     { name: '横移',   color: '#2563eb', glow: '#60a5fa', icon: '↔' },
+    MOVING_V:     { name: '纵移',   color: '#7c3aed', glow: '#a78bfa', icon: '↕' },
+    SPRING:       { name: '弹簧',   color: '#ea580c', glow: '#fb923c', icon: '⇈' },
+    DISAPPEARING: { name: '消失',   color: '#dc2626', glow: '#f87171', icon: '◌' },
+    CONVEYOR:     { name: '传送带', color: '#0d9488', glow: '#2dd4bf', icon: '→' },
+  };
+
+  // --- State ---
+  let player, cameraY, platforms, particles, score, bestScore;
+  let gameOver, gameStarted, frameCount;
+  let keys = {}, touchX = null;
+
+  bestScore = parseInt(localStorage.getItem('platformJumperBest') || '0');
+
+  // --- Input ---
+  window.addEventListener('keydown', e => {
+    keys[e.key] = true;
+    if (e.key === ' ' || e.key === 'ArrowUp') e.preventDefault();
+  });
+  window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+  canvas.addEventListener('touchstart', e => {
+    e.preventDefault();
+    touchX = e.touches[0].clientX;
+    if (!gameStarted) startGame();
+    if (gameOver) restartGame();
+  }, { passive: false });
+  canvas.addEventListener('touchmove', e => {
+    e.preventDefault();
+    touchX = e.touches[0].clientX;
+  }, { passive: false });
+  canvas.addEventListener('touchend', e => { touchX = null; });
+  canvas.addEventListener('mousedown', () => {
+    if (!gameStarted) startGame();
+    if (gameOver) restartGame();
+  });
+
+  // --- Factory Functions ---
+  function createPlayer() {
+    return { x: W / 2 - 15, y: H / 2, vx: 0, vy: 0, w: 30, h: 30, minY: H / 2 };
+  }
+
+  function createPlatform(x, y, type) {
+    const range = 40 + Math.random() * 55;
+    return {
+      x, y, w: PLATFORM_W, h: PLATFORM_H, type,
+      broken: false,
+      disappearing: false,
+      disappearTimer: 0,
+      movePhase: Math.random() * Math.PI * 2,
+      moveSpeed: 0.8 + Math.random() * 1.6,
+      moveRange: range,
+      originX: x,
+      originY: y,
+      conveyorPhase: Math.random() * Math.PI * 2,
+    };
+  }
+
+  function createParticle(x, y, color) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 3;
+    return {
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 1.5,
+      life: 1,
+      decay: 0.015 + Math.random() * 0.035,
+      size: 2 + Math.random() * 3,
+      color,
+    };
+  }
+
+  // --- Platform Generation ---
+  function pickType() {
+    const r = Math.random();
+    if (r < 0.32) return PT.NORMAL;
+    if (r < 0.47) return PT.BOUNCY;
+    if (r < 0.58) return PT.FRAGILE;
+    if (r < 0.68) return PT.MOVING_H;
+    if (r < 0.76) return PT.MOVING_V;
+    if (r < 0.82) return PT.SPRING;
+    if (r < 0.88) return PT.DISAPPEARING;
+    return PT.CONVEYOR;
+  }
+
+  function generatePlatforms() {
+    const plats = [];
+    // Starting platform — player stands on it at screen center
+    const startY = H * 0.5 + 30;
+    plats.push(createPlatform(W / 2 - PLATFORM_W / 2, startY, PT.NORMAL));
+
+    // Platforms above
+    let y = startY - 55;
+    while (y > -2500) {
+      const x = 15 + Math.random() * (W - PLATFORM_W - 30);
+      plats.push(createPlatform(x, y, pickType()));
+      y -= MIN_GAP + Math.random() * (MAX_GAP - MIN_GAP);
+    }
+    // Few normal platforms below starting position (visual fill, unreachable after climbing)
+    y = startY + 70;
+    while (y < H + 200) {
+      const x = 15 + Math.random() * (W - PLATFORM_W - 30);
+      plats.push(createPlatform(x, y, PT.NORMAL));
+      y += MIN_GAP + Math.random() * (MAX_GAP - MIN_GAP);
+    }
+    return plats;
+  }
+
+  function ensurePlatformsAbove() {
+    // Find highest platform (smallest y)
+    let topY = Infinity;
+    for (const p of platforms) {
+      if (!p.broken && p.y < topY) topY = p.y;
+    }
+    // Generate enough above camera
+    while (topY > -cameraY - 2200) {
+      topY -= MIN_GAP + Math.random() * (MAX_GAP - MIN_GAP);
+      const x = 15 + Math.random() * (W - PLATFORM_W - 30);
+      platforms.push(createPlatform(x, topY, pickType()));
+    }
+  }
+
+  function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) particles.push(createParticle(x, y, color));
+  }
+
+  // --- Game Flow ---
+  function startGame() {
+    player = createPlayer();
+    platforms = generatePlatforms();
+    // Place player on the starting platform
+    const startPlat = platforms[0];
+    player.y = startPlat.y - player.h;
+    player.minY = player.y;
+    // Center camera on player (cameraY = worldY of center on screen)
+    cameraY = player.y - H * 0.5;
+    particles = [];
+    score = 0;
+    gameOver = false;
+    gameStarted = true;
+    frameCount = 0;
+    // Audio: resume context + start background music
+    Audio.ensureCtx();
+    Audio.startBGM();
+  }
+
+  function restartGame() {
+    startGame();
+  }
+
+  function endGame() {
+    gameOver = true;
+    Audio.playGameOver();
+    if (score > bestScore) {
+      bestScore = score;
+      localStorage.setItem('platformJumperBest', bestScore.toString());
+    }
+    spawnParticles(player.x + player.w / 2, player.y - cameraY, '#ffffff', 25);
+  }
+
+  // --- Update ---
+  function update() {
+    if (!gameStarted) return;
+
+    frameCount++;
+
+    // Game over check
+    if (gameOver) {
+      // Still update particles in game over
+      for (const pt of particles) {
+        pt.x += pt.vx;
+        pt.y += pt.vy;
+        pt.vy += 0.1;
+        pt.life -= pt.decay;
+      }
+      particles = particles.filter(p => p.life > 0);
+      return;
+    }
+
+    // --- Input ---
+    let moveDir = 0;
+    if (keys['ArrowLeft'] || keys['a'] || keys['A']) moveDir = -1;
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) moveDir = 1;
+
+    if (touchX !== null) {
+      const rect = canvas.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      if (touchX < cx - 15) moveDir = -1;
+      else if (touchX > cx + 15) moveDir = 1;
+    }
+
+    // --- Player Physics ---
+    player.vx += (moveDir * PLAYER_SPEED - player.vx) * 0.3;
+
+    player.vy += GRAVITY;
+
+    // Terminal velocity
+    if (player.vy > 14) player.vy = 14;
+
+    player.x += player.vx;
+    player.y += player.vy;
+
+    // Wrap horizontally
+    if (player.x + player.w < 0) player.x = W;
+    if (player.x > W) player.x = -player.w;
+
+    // --- Score ---
+    // Score = upward distance from starting position
+    if (player.y < player.minY) player.minY = player.y;
+    score = Math.floor(Math.max(0, H / 2 - player.minY));
+
+    // --- Platform Updates ---
+    for (const p of platforms) {
+      if (p.broken) continue;
+
+      // Movement
+      if (p.type === PT.MOVING_H) {
+        p.movePhase += 0.015;
+        p.x = p.originX + Math.sin(p.movePhase * p.moveSpeed) * p.moveRange;
+      } else if (p.type === PT.MOVING_V) {
+        p.movePhase += 0.015;
+        p.y = p.originY + Math.sin(p.movePhase * p.moveSpeed) * p.moveRange * 0.5;
+      } else if (p.type === PT.CONVEYOR) {
+        p.conveyorPhase += 0.03;
+      }
+
+      // Disappearing countdown
+      if (p.disappearing) {
+        p.disappearTimer++;
+        if (p.disappearTimer > 45) {
+          p.broken = true;
+          p.disappearing = false;
+        }
+      }
+    }
+
+    // --- Collision ---
+    let landed = false;
+    if (player.vy >= 0) {
+      for (const p of platforms) {
+        if (p.broken) continue;
+
+        // Player feet bounds
+        const px1 = player.x + 5;
+        const px2 = player.x + player.w - 5;
+        const feetY = player.y + player.h;
+        const prevFeetY = feetY - player.vy;
+
+        if (px2 > p.x && px1 < p.x + p.w &&
+            prevFeetY <= p.y + 2 && feetY >= p.y && feetY <= p.y + p.h + 8) {
+
+          player.y = p.y - player.h;
+          landed = true;
+
+          switch (p.type) {
+            case PT.NORMAL:
+              player.vy = JUMP_FORCE;
+              break;
+            case PT.BOUNCY:
+              player.vy = JUMP_FORCE * 1.25;
+              spawnParticles(player.x + player.w / 2, player.y + player.h, p.type.glow, 8);
+              break;
+            case PT.FRAGILE:
+              player.vy = JUMP_FORCE;
+              p.broken = true;
+              spawnParticles(p.x + p.w / 2, p.y + p.h / 2, p.type.color, 14);
+              break;
+            case PT.MOVING_H:
+            case PT.MOVING_V:
+              player.vy = JUMP_FORCE;
+              break;
+            case PT.SPRING:
+              player.vy = SPRING_FORCE;
+              spawnParticles(player.x + player.w / 2, player.y + player.h, p.type.glow, 12);
+              break;
+            case PT.DISAPPEARING:
+              if (!p.disappearing) {
+                player.vy = JUMP_FORCE;
+                p.disappearing = true;
+              }
+              break;
+            case PT.CONVEYOR:
+              player.vy = JUMP_FORCE;
+              player.vx += (Math.sin(p.conveyorPhase) > 0 ? 3 : -3);
+              spawnParticles(player.x + player.w / 2, player.y + player.h, p.type.glow, 5);
+              break;
+          }
+          // Jelly jump SFX + platform-specific sound
+          Audio.playJump();
+          Audio.playPlatform(p.type);
+          break;
+        }
+      }
+    }
+
+    // --- Camera (smoothly follows highest point, player stays centered) ---
+    if (player.y < player.minY) player.minY = player.y;
+    const targetCY = player.minY - H * 0.5;
+    cameraY += (targetCY - cameraY) * 0.5;
+
+    // --- Generate more platforms ---
+    ensurePlatformsAbove();
+
+    // --- Cleanup ---
+    platforms = platforms.filter(p => {
+      if (p.broken) return false;
+      return p.y - cameraY < H + 80;
+    });
+
+    // --- Game Over ---
+    if (player.y - cameraY > H + 60) {
+      endGame();
+    }
+
+    // --- Particles ---
+    for (const pt of particles) {
+      pt.x += pt.vx;
+      pt.y += pt.vy;
+      pt.vy += 0.08;
+      pt.life -= pt.decay;
+    }
+    particles = particles.filter(p => p.life > 0);
+  }
+
+  // --- Render ---
+  function lerpColor(a, b, t) {
+    const ah = parseInt(a.replace('#', ''), 16);
+    const bh = parseInt(b.replace('#', ''), 16);
+    const ar = (ah >> 16) & 0xff, ag = (ah >> 8) & 0xff, ab = ah & 0xff;
+    const br = (bh >> 16) & 0xff, bg = (bh >> 8) & 0xff, bb = bh & 0xff;
+    const rr = Math.round(ar + (br - ar) * t);
+    const rg = Math.round(ag + (bg - ag) * t);
+    const rb = Math.round(ab + (bb - ab) * t);
+    return `rgb(${rr},${rg},${rb})`;
+  }
+
+  function drawBackground() {
+    const t = Math.min(1, score / 4000);
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, lerpColor('#0a0a2e', '#1a1050', t));
+    grad.addColorStop(0.5, lerpColor('#111144', '#2d1b69', t));
+    grad.addColorStop(1, lerpColor('#1a1040', '#4c1d95', t));
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    // Stars
+    for (let i = 0; i < 80; i++) {
+      const sx = ((i * 137 + 42) % W);
+      const baseY = (i * 251 + 42) % H;
+      const sy = (baseY + cameraY * 0.15) % H;
+      const bright = 0.3 + 0.7 * Math.sin(i * 2.7 + frameCount * 0.015);
+      ctx.globalAlpha = 0.2 + bright * 0.5;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(sx, sy < 0 ? sy + H : sy, 1.5, 1.5);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawPlayer() {
+    const px = player.x;
+    const py = player.y - cameraY;
+    const cx = px + player.w / 2;
+    const cy = py + player.h / 2;
+
+    ctx.save();
+
+    // Glow
+    const g = ctx.createRadialGradient(cx, cy, 3, cx, cy, 28);
+    g.addColorStop(0, 'rgba(200,210,255,0.35)');
+    g.addColorStop(1, 'rgba(200,210,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 28, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Squash & stretch
+    const vyNorm = Math.max(-1, Math.min(1, player.vy / 10));
+    const scaleX = 1 - vyNorm * 0.15;
+    const scaleY = 1 + vyNorm * 0.2;
+    ctx.translate(cx, cy);
+    ctx.scale(scaleX, scaleY);
+
+    // Body
+    const bg = ctx.createLinearGradient(0, -player.h / 2, 0, player.h / 2);
+    bg.addColorStop(0, '#f0f4ff');
+    bg.addColorStop(0.5, '#c7d2fe');
+    bg.addColorStop(1, '#818cf8');
+    ctx.fillStyle = bg;
+    ctx.beginPath();
+    ctx.roundRect(-player.w / 2 + 2, -player.h / 2 + 2, player.w - 4, player.h - 4, 7);
+    ctx.fill();
+
+    // Eyes
+    ctx.fillStyle = '#1e1b4b';
+    ctx.beginPath();
+    ctx.arc(-6, -3, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(6, -3, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Eye highlights
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(-4.5, -4.5, 1.3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(7.5, -4.5, 1.3, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function drawPlatform(p) {
+    const px = p.x;
+    const py = p.y - cameraY;
+    if (py < -30 || py > H + 30) return;
+
+    ctx.save();
+
+    const alpha = p.disappearing
+      ? 0.3 + 0.6 * Math.abs(Math.sin(p.disappearTimer * 0.25))
+      : 1;
+    ctx.globalAlpha = alpha;
+
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.beginPath();
+    ctx.roundRect(px + 2, py + 2, p.w, p.h, 5);
+    ctx.fill();
+
+    // Body
+    const grad = ctx.createLinearGradient(px, py, px, py + p.h);
+    grad.addColorStop(0, p.type.glow);
+    grad.addColorStop(1, p.type.color);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.roundRect(px, py, p.w, p.h, 5);
+    ctx.fill();
+
+    // Top edge highlight
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.beginPath();
+    ctx.roundRect(px + 2, py + 1, p.w - 4, p.h * 0.45, 3);
+    ctx.fill();
+
+    // Icon
+    if (p.type.icon) {
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.font = 'bold 10px "Segoe UI", "PingFang SC", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(p.type.icon, px + p.w / 2, py + p.h / 2 + 1);
+    }
+
+    // Spring visual
+    if (p.type === PT.SPRING) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      const sx = px + p.w / 2;
+      ctx.moveTo(sx - 8, py - 1);
+      ctx.lineTo(sx, py - 8);
+      ctx.lineTo(sx + 1, py - 3);
+      ctx.lineTo(sx + 8, py - 9);
+      ctx.stroke();
+    }
+
+    // Conveyor arrows
+    if (p.type === PT.CONVEYOR) {
+      const dir = Math.sin(p.conveyorPhase) > 0 ? 1 : -1;
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      for (let i = 0; i < 5; i++) {
+        const ax = px + 10 + i * 13;
+        const ay = py + 4;
+        ctx.beginPath();
+        ctx.moveTo(ax + dir * 3, ay);
+        ctx.lineTo(ax - dir * 2, ay - 2.5);
+        ctx.lineTo(ax - dir * 2, ay + 2.5);
+        ctx.closePath();
+        ctx.fill();
+      }
+      for (let i = 0; i < 5; i++) {
+        const ax = px + 10 + i * 13;
+        const ay = py + 10;
+        ctx.beginPath();
+        ctx.moveTo(ax + dir * 3, ay);
+        ctx.lineTo(ax - dir * 2, ay - 2.5);
+        ctx.lineTo(ax - dir * 2, ay + 2.5);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+
+    ctx.restore();
+  }
+
+  function drawParticles() {
+    for (const pt of particles) {
+      ctx.globalAlpha = pt.life;
+      ctx.fillStyle = pt.color;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y - cameraY, pt.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawUI() {
+    // Score display
+    ctx.textAlign = 'center';
+
+    // Score background
+    const scoreW = 140, scoreH = 55;
+    const scoreX = W / 2 - scoreW / 2, scoreY = 12;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.roundRect(scoreX, scoreY, scoreW, scoreH, 12);
+    ctx.fill();
+
+    // Current score
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 30px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.shadowColor = 'rgba(0,0,0,0.5)';
+    ctx.shadowBlur = 6;
+    ctx.fillText(Math.floor(score), W / 2, scoreY + 22);
+    ctx.shadowBlur = 0;
+
+    // Best score
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.font = '12px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('最佳: ' + bestScore, W / 2, scoreY + 45);
+
+    // Legend (bottom)
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.font = '8.5px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText('绿:普通 粉:弹力 黄:碎裂 蓝:横移 紫:纵移 橙:弹簧 红:消失 青:传送', W - 8, H - 6);
+  }
+
+  function drawStartScreen() {
+    // Dim overlay
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 38px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.shadowColor = 'rgba(99,102,241,0.6)';
+    ctx.shadowBlur = 20;
+    ctx.fillText('向上跳跃', W / 2, H / 2 - 60);
+    ctx.shadowBlur = 0;
+
+    // Subtitle
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.font = '15px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('← → 或 A D 键移动', W / 2, H / 2 - 10);
+    ctx.fillText('跳上平台不断向上!', W / 2, H / 2 + 16);
+    ctx.fillText('掉出屏幕则游戏结束', W / 2, H / 2 + 42);
+
+    // Platform examples
+    const exampleY = H / 2 + 85;
+    const examplePlats = [
+      { type: PT.NORMAL, x: 25 },
+      { type: PT.BOUNCY, x: 100 },
+      { type: PT.FRAGILE, x: 175 },
+      { type: PT.SPRING, x: 250 },
+      { type: PT.CONVEYOR, x: 325 },
+    ];
+    for (const ep of examplePlats) {
+      ep._plat = createPlatform(ep.x, exampleY + cameraY, ep.type);
+    }
+    // Temporarily set camera so they show at the right Y
+    const savedCY = cameraY;
+    for (const ep of examplePlats) {
+      cameraY = -(exampleY - H / 2 - 85);
+      // override - just draw them manually
+      const p = ep._plat;
+      const py = exampleY;
+      ctx.save();
+      const grad = ctx.createLinearGradient(ep.x, py, ep.x, py + PLATFORM_H);
+      grad.addColorStop(0, ep.type.glow);
+      grad.addColorStop(1, ep.type.color);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.roundRect(ep.x, py, PLATFORM_W * 0.7, PLATFORM_H, 4);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      ctx.beginPath();
+      ctx.roundRect(ep.x + 1, py + 1, PLATFORM_W * 0.7 - 2, PLATFORM_H * 0.45, 3);
+      ctx.fill();
+      if (ep.type.icon) {
+        ctx.fillStyle = 'rgba(255,255,255,0.7)';
+        ctx.font = '8px "Segoe UI", "PingFang SC", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(ep.type.icon, ep.x + PLATFORM_W * 0.35, py + PLATFORM_H / 2);
+      }
+      ctx.restore();
+    }
+    cameraY = savedCY;
+
+    // Pulsing start text
+    const pulse = Math.sin(Date.now() * 0.004) * 0.3 + 0.7;
+    ctx.fillStyle = '#ffffff';
+    ctx.globalAlpha = pulse;
+    ctx.font = 'bold 18px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('按空格键 / 点击屏幕 开始', W / 2, exampleY + 55);
+    ctx.globalAlpha = 1;
+
+    // Best score
+    if (bestScore > 0) {
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = '14px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillText('历史最佳: ' + bestScore, W / 2, exampleY + 80);
+    }
+  }
+
+  function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 38px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('游戏结束', W / 2, H / 2 - 55);
+
+    ctx.font = '22px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('得分: ' + Math.floor(score), W / 2, H / 2 - 5);
+
+    if (score >= bestScore && score > 0) {
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = 'bold 22px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillText('新纪录!', W / 2, H / 2 + 30);
+    } else {
+      ctx.fillStyle = 'rgba(255,255,255,0.65)';
+      ctx.font = '16px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillText('历史最佳: ' + bestScore, W / 2, H / 2 + 30);
+    }
+
+    const pulse = Math.sin(Date.now() * 0.004) * 0.3 + 0.7;
+    ctx.fillStyle = '#ffffff';
+    ctx.globalAlpha = pulse;
+    ctx.font = 'bold 18px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('按空格键 / 点击屏幕 重新开始', W / 2, H / 2 + 72);
+    ctx.globalAlpha = 1;
+  }
+
+  // --- Main Loop ---
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    drawBackground();
+
+    for (const p of platforms) drawPlatform(p);
+    drawParticles();
+    drawPlayer();
+    drawUI();
+
+    if (!gameStarted) {
+      drawStartScreen();
+    } else if (gameOver) {
+      drawGameOver();
+    }
+  }
+
+  function gameLoop() {
+    update();
+    render();
+    requestAnimationFrame(gameLoop);
+  }
+
+  // --- Init ---
+  function init() {
+    cameraY = 0;
+    platforms = generatePlatforms();
+    particles = [];
+    score = 0;
+    player = createPlayer();
+    gameOver = false;
+    gameStarted = false;
+    frameCount = 0;
+  }
+
+  // Keyboard start / restart
+  window.addEventListener('keydown', function startHandler(e) {
+    if (e.key === ' ' || e.key === 'Enter') {
+      if (!gameStarted) startGame();
+      else if (gameOver) restartGame();
+    }
+  });
+
+  // roundRect polyfill
+  if (!ctx.roundRect) {
+    ctx.roundRect = function(x, y, w, h, r) {
+      if (typeof r === 'number') r = { tl: r, tr: r, br: r, bl: r };
+      ctx.beginPath();
+      ctx.moveTo(x + r.tl, y);
+      ctx.lineTo(x + w - r.tr, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + r.tr);
+      ctx.lineTo(x + w, y + h - r.br);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - r.br, y + h);
+      ctx.lineTo(x + r.bl, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - r.bl);
+      ctx.lineTo(x, y + r.tl);
+      ctx.quadraticCurveTo(x, y, x + r.tl, y);
+      ctx.closePath();
+    };
+  }
+
+  init();
+  gameLoop();
+})();
+</script>
+</body>
+</html>
