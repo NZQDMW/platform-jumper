@@ -330,7 +330,16 @@
       playTone(80, 'sawtooth', 0.15, 0.06, sfxBus, 0, 200);
     }
 
-    return { ensureCtx, playJump, playPlatform, startBGM, stopBGM, playGameOver, playBoost };
+    // --- Pickup sound: sparkly chime ---
+    function playPickup() {
+      ensureCtx();
+      const t = ctx.currentTime;
+      playTone(880, 'sine', 0.1, 0.2, sfxBus, 0, 1760);
+      setTimeout(() => playTone(1320, 'sine', 0.1, 0.15, sfxBus, 0, 2200), 60);
+      setTimeout(() => playTone(1760, 'sine', 0.12, 0.12, sfxBus, 0, 2640), 120);
+    }
+
+    return { ensureCtx, playJump, playPlatform, startBGM, stopBGM, playGameOver, playBoost, playPickup };
   })();
 
   // --- Constants ---
@@ -343,7 +352,7 @@
   const MIN_GAP = 45;
   const MAX_GAP = 95;
   const MAX_ENERGY = 100;
-  const BOOST_COST = 0.55;
+  const BOOST_COST = 0.65;
   const ENERGY_REGEN = 0.06;
   const BOOST_FORCE = -1.8;
 
@@ -360,9 +369,10 @@
   };
 
   // --- State ---
-  let player, cameraY, platforms, particles, score, bestScore;
+  let player, cameraY, platforms, particles, pickups, score, bestScore;
   let gameOver, gameStarted, frameCount;
   let keys = {}, touches = {};
+  let tutorialActive = false;
 
   bestScore = parseInt(localStorage.getItem('platformJumperBest') || '0');
 
@@ -382,6 +392,12 @@
   canvas.addEventListener('touchstart', e => {
     e.preventDefault();
     updateTouches(e);
+    if (tutorialActive) {
+      tutorialActive = false;
+      localStorage.setItem('platformJumperTutorialDone', '1');
+      startGame();
+      return;
+    }
     if (!gameStarted) startGame();
     if (gameOver) restartGame();
   }, { passive: false });
@@ -392,6 +408,12 @@
   canvas.addEventListener('touchend', e => { updateTouches(e); });
   canvas.addEventListener('touchcancel', e => { updateTouches(e); });
   canvas.addEventListener('mousedown', () => {
+    if (tutorialActive) {
+      tutorialActive = false;
+      localStorage.setItem('platformJumperTutorialDone', '1');
+      startGame();
+      return;
+    }
     if (!gameStarted) startGame();
     if (gameOver) restartGame();
   });
@@ -418,6 +440,10 @@
       originY: y,
       conveyorPhase: Math.random() * Math.PI * 2,
     };
+  }
+
+  function createPickup(x, y) {
+    return { x, y, w: 18, h: 18, collected: false, phase: Math.random() * Math.PI * 2 };
   }
 
   function createParticle(x, y, color) {
@@ -449,6 +475,7 @@
 
   function generatePlatforms() {
     const plats = [];
+    const pkus = [];
     // Starting platform — player stands on it at screen center
     const startY = H * 0.5 + 30;
     plats.push(createPlatform(W / 2 - PLATFORM_W / 2, startY, PT.NORMAL));
@@ -458,6 +485,7 @@
     while (y > -2500) {
       const x = 15 + Math.random() * (W - PLATFORM_W - 30);
       plats.push(createPlatform(x, y, pickType()));
+      if (Math.random() < 0.18) pkus.push(createPickup(x + PLATFORM_W / 2 - 9, y - 26));
       y -= MIN_GAP + Math.random() * (MAX_GAP - MIN_GAP);
     }
     // Few normal platforms below starting position (visual fill, unreachable after climbing)
@@ -467,7 +495,7 @@
       plats.push(createPlatform(x, y, PT.NORMAL));
       y += MIN_GAP + Math.random() * (MAX_GAP - MIN_GAP);
     }
-    return plats;
+    return { plats, pkus };
   }
 
   function ensurePlatformsAbove() {
@@ -481,6 +509,7 @@
       topY -= MIN_GAP + Math.random() * (MAX_GAP - MIN_GAP);
       const x = 15 + Math.random() * (W - PLATFORM_W - 30);
       platforms.push(createPlatform(x, topY, pickType()));
+      if (Math.random() < 0.18) pickups.push(createPickup(x + PLATFORM_W / 2 - 9, topY - 26));
     }
   }
 
@@ -491,7 +520,9 @@
   // --- Game Flow ---
   function startGame() {
     player = createPlayer();
-    platforms = generatePlatforms();
+    const gen = generatePlatforms();
+    platforms = gen.plats;
+    pickups = gen.pkus;
     // Place player on the starting platform
     const startPlat = platforms[0];
     player.y = startPlat.y - player.h;
@@ -718,6 +749,21 @@
     const targetCY = player.minY - H * 0.5;
     cameraY += (targetCY - cameraY) * 0.5;
 
+    // --- Pickup collision ---
+    for (const pk of pickups) {
+      if (pk.collected) continue;
+      const px1 = player.x + 2;
+      const px2 = player.x + player.w - 2;
+      const py1 = player.y + 2;
+      const py2 = player.y + player.h - 2;
+      if (px2 > pk.x && px1 < pk.x + pk.w && py2 > pk.y && py1 < pk.y + pk.h) {
+        pk.collected = true;
+        player.energy = Math.min(MAX_ENERGY, player.energy + 35);
+        Audio.playPickup();
+        spawnParticles(pk.x + pk.w / 2, pk.y + pk.h / 2, '#fbbf24', 8);
+      }
+    }
+
     // --- Generate more platforms ---
     ensurePlatformsAbove();
 
@@ -726,6 +772,7 @@
       if (p.broken) return false;
       return p.y - cameraY < H + 80;
     });
+    pickups = pickups.filter(p => !p.collected && p.y - cameraY < H + 80);
 
     // --- Game Over ---
     if (player.y - cameraY > H + 60) {
@@ -950,6 +997,55 @@
       ctx.fill();
     }
     ctx.globalAlpha = 1;
+  }
+
+  function drawPickups() {
+    for (const pk of pickups) {
+      if (pk.collected) continue;
+      const py = pk.y - cameraY;
+      if (py < -30 || py > H + 30) continue;
+      const cx = pk.x + pk.w / 2;
+      const cy = pk.y + pk.h / 2;
+      const sy = py + pk.h / 2;
+
+      ctx.save();
+
+      // Outer glow pulse
+      const pulse = Math.sin(frameCount * 0.06 + pk.phase) * 0.25 + 0.75;
+      const glowGrad = ctx.createRadialGradient(cx, sy, 2, cx, sy, 16);
+      glowGrad.addColorStop(0, `rgba(251,191,36,${0.6 * pulse})`);
+      glowGrad.addColorStop(0.5, `rgba(250,204,21,${0.3 * pulse})`);
+      glowGrad.addColorStop(1, 'rgba(250,204,21,0)');
+      ctx.fillStyle = glowGrad;
+      ctx.beginPath();
+      ctx.arc(cx, sy, 16, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Core orb
+      const orbGrad = ctx.createRadialGradient(cx - 1, sy - 2, 1, cx, sy, 8);
+      orbGrad.addColorStop(0, '#ffffff');
+      orbGrad.addColorStop(0.3, '#fef3c7');
+      orbGrad.addColorStop(0.7, '#f59e0b');
+      orbGrad.addColorStop(1, '#d97706');
+      ctx.fillStyle = orbGrad;
+      ctx.beginPath();
+      ctx.arc(cx, sy, 7, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Sparkle
+      const sparkAngle = frameCount * 0.05 + pk.phase;
+      for (let i = 0; i < 3; i++) {
+        const sa = sparkAngle + i * Math.PI * 2 / 3;
+        const sx = cx + Math.cos(sa) * 5;
+        const sy2 = sy + Math.sin(sa) * 5;
+        ctx.fillStyle = 'rgba(255,255,255,0.9)';
+        ctx.beginPath();
+        ctx.arc(sx, sy2, 1.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
   }
 
   function drawEnergyBar() {
@@ -1183,15 +1279,122 @@
     drawBackground();
 
     for (const p of platforms) drawPlatform(p);
+    drawPickups();
     drawParticles();
     drawPlayer();
     drawUI();
 
-    if (!gameStarted) {
+    if (tutorialActive) {
+      drawTutorial();
+    } else if (!gameStarted) {
       drawStartScreen();
     } else if (gameOver) {
       drawGameOver();
     }
+  }
+
+  function drawTutorial() {
+    // Dim background
+    ctx.fillStyle = 'rgba(0,0,0,0.78)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = 'center';
+
+    // Title
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 26px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('触屏操作指南', W / 2, H * 0.18);
+
+    // ---- Touch zones illustration ----
+    const zoneY = H * 0.32;
+    const zoneH = 180;
+    const zoneW = W * 0.35;
+
+    // Left zone
+    ctx.fillStyle = 'rgba(59,130,246,0.18)';
+    ctx.beginPath();
+    ctx.roundRect(10, zoneY, zoneW, zoneH, 16);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(59,130,246,0.5)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.lineWidth = 1;
+
+    const lx = 10 + zoneW / 2;
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 15px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('按住左边', lx, zoneY + 48);
+    ctx.font = '36px "Segoe UI", "PingFang SC", sans-serif';
+    ctx.fillText('👈', lx, zoneY + 100);
+    ctx.font = 'bold 14px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('向左移动', lx, zoneY + 140);
+
+    // Right zone
+    const rx = W - 10 - zoneW;
+    ctx.fillStyle = 'rgba(239,68,68,0.18)';
+    ctx.beginPath();
+    ctx.roundRect(rx, zoneY, zoneW, zoneH, 16);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(239,68,68,0.5)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 4]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.lineWidth = 1;
+
+    const rcx = rx + zoneW / 2;
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 15px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('按住右边', rcx, zoneY + 48);
+    ctx.font = '36px "Segoe UI", "PingFang SC", sans-serif';
+    ctx.fillText('👉', rcx, zoneY + 100);
+    ctx.font = 'bold 14px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('向右移动', rcx, zoneY + 140);
+
+    // Boost zone (center)
+    const boostY = zoneY + zoneH + 16;
+    ctx.fillStyle = 'rgba(168,85,247,0.2)';
+    ctx.beginPath();
+    ctx.roundRect(W * 0.15, boostY, W * 0.7, 60, 14);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(168,85,247,0.6)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 3]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.lineWidth = 1;
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 15px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('👆 同时按住左右 👆', W / 2, boostY + 22);
+    ctx.font = 'bold 13px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('向上喷气 (消耗能量)', W / 2, boostY + 44);
+
+    // Energy note
+    const noteY = boostY + 80;
+    ctx.fillStyle = '#fbbf24';
+    ctx.font = 'bold 14px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('⚡ 拾取平台上的金色能量球回复能量', W / 2, noteY);
+
+    // Dismiss button
+    const btnW = 180, btnH = 44;
+    const btnX = W / 2 - btnW / 2, btnY = H * 0.84;
+    const pulse = Math.sin(Date.now() * 0.004) * 0.25 + 0.75;
+
+    ctx.fillStyle = `rgba(59,130,246,${0.7 * pulse})`;
+    ctx.beginPath();
+    ctx.roundRect(btnX, btnY, btnW, btnH, 22);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.lineWidth = 1;
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 16px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('知道了，开始游戏!', W / 2, btnY + btnH / 2 + 1);
   }
 
   function gameLoop() {
@@ -1203,18 +1406,30 @@
   // --- Init ---
   function init() {
     cameraY = 0;
-    platforms = generatePlatforms();
+    const gen = generatePlatforms();
+    platforms = gen.plats;
+    pickups = gen.pkus;
     particles = [];
     score = 0;
     player = createPlayer();
     gameOver = false;
     gameStarted = false;
     frameCount = 0;
+    // Show tutorial for touch players on first visit
+    if (!localStorage.getItem('platformJumperTutorialDone')) {
+      tutorialActive = true;
+    }
   }
 
   // Keyboard start / restart
   window.addEventListener('keydown', function startHandler(e) {
     if (e.key === ' ' || e.key === 'Enter') {
+      if (tutorialActive) {
+        tutorialActive = false;
+        localStorage.setItem('platformJumperTutorialDone', '1');
+        startGame();
+        return;
+      }
       if (!gameStarted) startGame();
       else if (gameOver) restartGame();
     }
