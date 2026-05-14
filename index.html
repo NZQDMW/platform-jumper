@@ -482,7 +482,7 @@
 
     // Platforms above
     let y = startY - 55;
-    while (y > -2500) {
+    while (y > -8000) {
       const x = 15 + Math.random() * (W - PLATFORM_W - 30);
       plats.push(createPlatform(x, y, pickType()));
       if (Math.random() < 0.18) pkus.push(createPickup(x + PLATFORM_W / 2 - 9, y - 26));
@@ -499,13 +499,13 @@
   }
 
   function ensurePlatformsAbove() {
-    // Find highest platform (smallest y)
+    // Find highest platform (smallest y = highest in world)
     let topY = Infinity;
     for (const p of platforms) {
       if (!p.broken && p.y < topY) topY = p.y;
     }
-    // Generate enough above camera
-    while (topY > -cameraY - 2200) {
+    // Always keep at least 2500px of platforms above the player
+    while (topY > player.y - 2500) {
       topY -= MIN_GAP + Math.random() * (MAX_GAP - MIN_GAP);
       const x = 15 + Math.random() * (W - PLATFORM_W - 30);
       platforms.push(createPlatform(x, topY, pickType()));
