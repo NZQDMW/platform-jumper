@@ -614,7 +614,7 @@
 
     // --- Jet Boost ---
     player.boosting = false;
-    if (boostInput && player.energy > 0 && !gameOver) {
+    if (boostInput && player.energy >= BOOST_COST && !gameOver) {
       if (frameCount % 10 === 0) Audio.playBoost();
       player.boosting = true;
       player.vy += BOOST_FORCE;
