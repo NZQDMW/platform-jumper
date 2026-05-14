@@ -351,9 +351,9 @@
   const PLATFORM_H = 14;
   const MIN_GAP = 45;
   const MAX_GAP = 95;
-  const MAX_ENERGY = 100;
+  const MAX_ENERGY = 40;
   const BOOST_COST = 2.2;
-  const ENERGY_REGEN = 0.06;
+  const ENERGY_REGEN = 0.18;
   const BOOST_FORCE = -1.8;
 
   // --- Platform Types ---
@@ -758,7 +758,7 @@
       const py2 = player.y + player.h - 2;
       if (px2 > pk.x && px1 < pk.x + pk.w && py2 > pk.y && py1 < pk.y + pk.h) {
         pk.collected = true;
-        player.energy = Math.min(MAX_ENERGY, player.energy + 35);
+        player.energy = Math.min(MAX_ENERGY, player.energy + 15);
         Audio.playPickup();
         spawnParticles(pk.x + pk.w / 2, pk.y + pk.h / 2, '#fbbf24', 8);
       }
