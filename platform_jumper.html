@@ -499,13 +499,24 @@
   }
 
   function ensurePlatformsAbove() {
-    // Find highest platform (smallest y = highest in world)
+    // Count live platforms within 2500px above player, fill gaps left by destroyed ones
+    let count = 0;
     let topY = Infinity;
     for (const p of platforms) {
-      if (!p.broken && p.y < topY) topY = p.y;
+      if (p.broken) continue;
+      if (p.y < topY) topY = p.y;
+      if (p.y < player.y && p.y > player.y - 2500) count++;
     }
-    // Always keep at least 2500px of platforms above the player
-    while (topY > player.y - 2500) {
+    // Fill gaps: maintain ~35 platforms in the 2500px range above player
+    while (count < 35) {
+      const y = player.y - 60 - Math.random() * 2400;
+      const x = 15 + Math.random() * (W - PLATFORM_W - 30);
+      platforms.push(createPlatform(x, y, pickType()));
+      if (Math.random() < 0.18) pickups.push(createPickup(x + PLATFORM_W / 2 - 9, y - 26));
+      count++;
+    }
+    // Extend platforms far above player for climbing ahead
+    while (topY > player.y - 4500) {
       topY -= MIN_GAP + Math.random() * (MAX_GAP - MIN_GAP);
       const x = 15 + Math.random() * (W - PLATFORM_W - 30);
       platforms.push(createPlatform(x, topY, pickType()));
