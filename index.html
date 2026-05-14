@@ -322,7 +322,15 @@
       rumble.stop(t + 1.2);
     }
 
-    return { ensureCtx, playJump, playPlatform, startBGM, stopBGM, playGameOver };
+    // --- Boost sound: jet whoosh ---
+    function playBoost() {
+      ensureCtx();
+      const t = ctx.currentTime;
+      playNoise(0.15, 0.08, sfxBus, 2000);
+      playTone(80, 'sawtooth', 0.15, 0.06, sfxBus, 0, 200);
+    }
+
+    return { ensureCtx, playJump, playPlatform, startBGM, stopBGM, playGameOver, playBoost };
   })();
 
   // --- Constants ---
@@ -334,6 +342,10 @@
   const PLATFORM_H = 14;
   const MIN_GAP = 45;
   const MAX_GAP = 95;
+  const MAX_ENERGY = 100;
+  const BOOST_COST = 0.55;
+  const ENERGY_REGEN = 0.06;
+  const BOOST_FORCE = -0.35;
 
   // --- Platform Types ---
   const PT = {
@@ -350,7 +362,7 @@
   // --- State ---
   let player, cameraY, platforms, particles, score, bestScore;
   let gameOver, gameStarted, frameCount;
-  let keys = {}, touchX = null;
+  let keys = {}, touches = {};
 
   bestScore = parseInt(localStorage.getItem('platformJumperBest') || '0');
 
@@ -361,17 +373,24 @@
   });
   window.addEventListener('keyup', e => { keys[e.key] = false; });
 
+  function updateTouches(e) {
+    touches = {};
+    for (let i = 0; i < e.touches.length; i++) {
+      touches[e.touches[i].identifier] = e.touches[i].clientX;
+    }
+  }
   canvas.addEventListener('touchstart', e => {
     e.preventDefault();
-    touchX = e.touches[0].clientX;
+    updateTouches(e);
     if (!gameStarted) startGame();
     if (gameOver) restartGame();
   }, { passive: false });
   canvas.addEventListener('touchmove', e => {
     e.preventDefault();
-    touchX = e.touches[0].clientX;
+    updateTouches(e);
   }, { passive: false });
-  canvas.addEventListener('touchend', e => { touchX = null; });
+  canvas.addEventListener('touchend', e => { updateTouches(e); });
+  canvas.addEventListener('touchcancel', e => { updateTouches(e); });
   canvas.addEventListener('mousedown', () => {
     if (!gameStarted) startGame();
     if (gameOver) restartGame();
@@ -379,7 +398,10 @@
 
   // --- Factory Functions ---
   function createPlayer() {
-    return { x: W / 2 - 15, y: H / 2, vx: 0, vy: 0, w: 30, h: 30, minY: H / 2 };
+    return {
+      x: W / 2 - 15, y: H / 2, vx: 0, vy: 0, w: 30, h: 30, minY: H / 2,
+      energy: MAX_ENERGY, boosting: false, boostTimer: 0
+    };
   }
 
   function createPlatform(x, y, type) {
@@ -521,14 +543,34 @@
 
     // --- Input ---
     let moveDir = 0;
-    if (keys['ArrowLeft'] || keys['a'] || keys['A']) moveDir = -1;
-    if (keys['ArrowRight'] || keys['d'] || keys['D']) moveDir = 1;
+    let boostInput = false;
+    const keyLeft = keys['ArrowLeft'] || keys['a'] || keys['A'];
+    const keyRight = keys['ArrowRight'] || keys['d'] || keys['D'];
 
-    if (touchX !== null) {
-      const rect = canvas.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      if (touchX < cx - 15) moveDir = -1;
-      else if (touchX > cx + 15) moveDir = 1;
+    if (keyLeft && keyRight) {
+      boostInput = true;
+    } else if (keyLeft) {
+      moveDir = -1;
+    } else if (keyRight) {
+      moveDir = 1;
+    }
+
+    // Multi-touch: detect touches on both sides for boost
+    const rect = canvas.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const touchIds = Object.keys(touches);
+    let touchLeft = false, touchRight = false;
+    for (const id of touchIds) {
+      if (touches[id] < cx - 15) touchLeft = true;
+      else if (touches[id] > cx + 15) touchRight = true;
+    }
+    if (touchLeft && touchRight) {
+      boostInput = true;
+      moveDir = 0;
+    } else if (touchLeft) {
+      moveDir = -1;
+    } else if (touchRight) {
+      moveDir = 1;
     }
 
     // --- Player Physics ---
@@ -538,6 +580,42 @@
 
     // Terminal velocity
     if (player.vy > 14) player.vy = 14;
+
+    // --- Jet Boost ---
+    player.boosting = false;
+    if (boostInput && player.energy > 0 && !gameOver) {
+      if (frameCount % 10 === 0) Audio.playBoost();
+      player.boosting = true;
+      player.vy += BOOST_FORCE;
+      if (player.vy < -10) player.vy = -10; // boost cap
+      player.energy -= BOOST_COST;
+      if (player.energy < 0) player.energy = 0;
+      player.boostTimer = 4;
+      // Boost particles
+      if (frameCount % 2 === 0) {
+        for (let i = 0; i < 3; i++) {
+          const bx = player.x + player.w / 2 + (Math.random() - 0.5) * 20;
+          const by = player.y + player.h;
+          particles.push({
+            x: bx, y: by,
+            vx: (Math.random() - 0.5) * 2,
+            vy: 2 + Math.random() * 4,
+            life: 1,
+            decay: 0.03 + Math.random() * 0.05,
+            size: 1.5 + Math.random() * 3,
+            color: Math.random() < 0.5 ? '#60a5fa' : '#a78bfa',
+          });
+        }
+      }
+    }
+    // Boost cooldown timer for visual
+    if (player.boostTimer > 0 && !player.boosting) player.boostTimer--;
+
+    // Energy regeneration
+    if (!player.boosting && player.energy < MAX_ENERGY) {
+      player.energy += ENERGY_REGEN;
+      if (player.energy > MAX_ENERGY) player.energy = MAX_ENERGY;
+    }
 
     player.x += player.vx;
     player.y += player.vy;
@@ -751,6 +829,32 @@
     ctx.fill();
 
     ctx.restore();
+
+    // Boost flame effect below player
+    if (player.boosting) {
+      const bx = cx;
+      const by = py + player.h + 2;
+      for (let i = 0; i < 5; i++) {
+        const fx = bx + (Math.random() - 0.5) * 16;
+        const fy = by + Math.random() * 14;
+        const fs = 3 + Math.random() * 6;
+        const alpha = 0.4 + Math.random() * 0.5;
+        const hue = Math.random() < 0.5 ? 210 : 260; // blue or purple
+        ctx.fillStyle = `hsla(${hue}, 90%, 65%, ${alpha})`;
+        ctx.beginPath();
+        ctx.arc(fx, fy, fs, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // Core flame
+      const coreGrad = ctx.createRadialGradient(bx, by, 0, bx, by, 9);
+      coreGrad.addColorStop(0, 'rgba(255,255,255,0.8)');
+      coreGrad.addColorStop(0.3, 'rgba(147,197,253,0.6)');
+      coreGrad.addColorStop(1, 'rgba(59,130,246,0)');
+      ctx.fillStyle = coreGrad;
+      ctx.beginPath();
+      ctx.arc(bx, by, 9, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   function drawPlatform(p) {
@@ -848,30 +952,113 @@
     ctx.globalAlpha = 1;
   }
 
+  function drawEnergyBar() {
+    if (!gameStarted) return;
+    const barW = W - 24, barH = 14;
+    const barX = 12, barY = 8;
+    const ratio = player.energy / MAX_ENERGY;
+
+    ctx.save();
+
+    // Outer glow
+    const glowAlpha = player.boosting ? 0.6 : 0.25;
+    ctx.shadowColor = player.boosting ? '#60a5fa' : '#3b82f6';
+    ctx.shadowBlur = player.boosting ? 16 : 8;
+
+    // Background track
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.beginPath();
+    ctx.roundRect(barX, barY, barW, barH, 7);
+    ctx.fill();
+
+    // Pulses when boosting
+    if (player.boosting) {
+      const pulseW = barW + 4 + Math.sin(frameCount * 0.3) * 4;
+      const pulseH = barH + 2 + Math.sin(frameCount * 0.3) * 2;
+      ctx.strokeStyle = 'rgba(96,165,250,0.4)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.roundRect(barX - (pulseW - barW) / 2, barY - (pulseH - barH) / 2, pulseW, pulseH, 8);
+      ctx.stroke();
+      ctx.lineWidth = 1;
+    }
+
+    ctx.shadowBlur = 0;
+
+    // Energy fill with gradient
+    if (ratio > 0) {
+      let gradColor1, gradColor2;
+      if (ratio > 0.5) {
+        gradColor1 = '#3b82f6';
+        gradColor2 = '#60a5fa';
+      } else if (ratio > 0.2) {
+        gradColor1 = '#f59e0b';
+        gradColor2 = '#fbbf24';
+      } else {
+        gradColor1 = '#ef4444';
+        gradColor2 = '#f87171';
+      }
+      const grad = ctx.createLinearGradient(barX, barY, barX + barW * ratio, barY);
+      grad.addColorStop(0, gradColor1);
+      grad.addColorStop(1, gradColor2);
+
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.roundRect(barX, barY, Math.max(barH, barW * ratio), barH, 7);
+      ctx.fill();
+
+      // Shine line on top of fill
+      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.beginPath();
+      ctx.roundRect(barX + 2, barY + 1.5, Math.max(barH - 4, barW * ratio - 4), barH * 0.3, 3);
+      ctx.fill();
+    }
+
+    // Energy text
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 9px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.shadowColor = 'rgba(0,0,0,0.8)';
+    ctx.shadowBlur = 2;
+    ctx.fillText('能量 ' + Math.ceil(player.energy) + '/' + MAX_ENERGY, W / 2, barY + barH / 2 + 1);
+    ctx.shadowBlur = 0;
+
+    // Boost hint
+    if (player.boosting) {
+      ctx.fillStyle = 'rgba(96,165,250,0.9)';
+      ctx.font = 'bold 10px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+      ctx.fillText('喷气加速中!', W / 2, barY + barH + 13);
+    }
+
+    ctx.restore();
+  }
+
   function drawUI() {
-    // Score display
+    // Energy bar at top
+    drawEnergyBar();
+
+    // Score display (shifted down for energy bar)
     ctx.textAlign = 'center';
 
-    // Score background
-    const scoreW = 140, scoreH = 55;
-    const scoreX = W / 2 - scoreW / 2, scoreY = 12;
+    const scoreW = 130, scoreH = 48;
+    const scoreX = W / 2 - scoreW / 2, scoreY = 36;
     ctx.fillStyle = 'rgba(0,0,0,0.35)';
     ctx.beginPath();
-    ctx.roundRect(scoreX, scoreY, scoreW, scoreH, 12);
+    ctx.roundRect(scoreX, scoreY, scoreW, scoreH, 10);
     ctx.fill();
 
     // Current score
     ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 30px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.font = 'bold 27px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
     ctx.shadowColor = 'rgba(0,0,0,0.5)';
     ctx.shadowBlur = 6;
-    ctx.fillText(Math.floor(score), W / 2, scoreY + 22);
+    ctx.fillText(Math.floor(score), W / 2, scoreY + 20);
     ctx.shadowBlur = 0;
 
     // Best score
     ctx.fillStyle = 'rgba(255,255,255,0.55)';
-    ctx.font = '12px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
-    ctx.fillText('最佳: ' + bestScore, W / 2, scoreY + 45);
+    ctx.font = '11px "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif';
+    ctx.fillText('最佳: ' + bestScore, W / 2, scoreY + 40);
 
     // Legend (bottom)
     ctx.fillStyle = 'rgba(255,255,255,0.3)';
